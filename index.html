@@ -36,6 +36,7 @@ textarea.form-input{resize:vertical;min-height:110px}
 .btn-submit:hover{opacity:.9}
 .btn-submit:disabled{opacity:.5;cursor:not-allowed}
 .err{color:var(--red);font-size:12.5px;margin-top:4px;min-height:16px}
+.note{font-size:12px;color:var(--text3);margin-top:4px;min-height:0}
 .success{text-align:center;padding:20px 0}
 .success .check{width:52px;height:52px;border-radius:50%;background:rgba(22,163,74,.12);color:#16a34a;display:flex;align-items:center;justify-content:center;font-size:26px;margin:0 auto 16px}
 .success h2{font-size:18px;margin-bottom:8px}
@@ -54,45 +55,54 @@ textarea.form-input{resize:vertical;min-height:110px}
       <div class="form-row">
         <div class="form-group">
           <label class="form-label">Name <span class="req">*</span></label>
-          <input class="form-input" id="f-name" required>
+          <input class="form-input" id="f-name" maxlength="100" required>
         </div>
         <div class="form-group">
           <label class="form-label">Email <span class="req">*</span></label>
-          <input class="form-input" id="f-email" type="email" required>
+          <input class="form-input" id="f-email" type="email" maxlength="200" required>
         </div>
       </div>
       <div class="form-row">
         <div class="form-group">
           <label class="form-label">Order Number</label>
-          <input class="form-input" id="f-order" placeholder="e.g. 10482">
+          <input class="form-input" id="f-order" maxlength="40" placeholder="e.g. 10482">
         </div>
         <div class="form-group">
           <label class="form-label">Part Number</label>
-          <input class="form-input" id="f-pn" placeholder="If known">
+          <input class="form-input" id="f-pn" maxlength="60" placeholder="If known">
         </div>
       </div>
       <div class="form-group">
         <label class="form-label">Subject <span class="req">*</span></label>
-        <input class="form-input" id="f-subject" placeholder="Brief summary of the issue" required>
+        <input class="form-input" id="f-subject" maxlength="150" placeholder="Brief summary of the issue" required>
       </div>
       <div class="form-group">
         <label class="form-label">Message <span class="req">*</span></label>
-        <textarea class="form-input" id="f-message" placeholder="Describe what's happening in as much detail as you can..." required></textarea>
+        <textarea class="form-input" id="f-message" maxlength="5000" placeholder="Describe what's happening in as much detail as you can..." required></textarea>
       </div>
       <div class="form-group">
         <label class="form-label">Photos (optional)</label>
         <input class="form-input" id="f-files" type="file" multiple accept="image/*,.pdf">
       </div>
 
-      <!-- Honeypot: hidden from real visitors via CSS, bots that auto-fill every field will trip this -->
+      <!-- Honeypot: hidden from real visitors via CSS, bots that auto-fill every field will trip this.
+           Deliberately NOT named "website"/"url": browsers autofill those and would flag real customers. -->
       <div style="position:absolute;left:-9999px;top:-9999px" aria-hidden="true">
         <label>Leave this field blank</label>
-        <input type="text" id="f-website" name="website" tabindex="-1" autocomplete="off">
+        <input type="text" id="f-hp" name="hp-ref" tabindex="-1" autocomplete="off">
       </div>
 
-      <div class="form-group">
+      <!-- Fallback check, only shown when no Turnstile site key is set below -->
+      <div class="form-group" id="mathWrap">
         <label class="form-label">Quick check: what is <span id="mathLabel">?</span>? <span class="req">*</span></label>
         <input class="form-input" id="f-mathAnswer" type="number" inputmode="numeric" required>
+      </div>
+
+      <!-- Cloudflare Turnstile security check -->
+      <div id="tsWrap" style="display:none;margin-bottom:14px">
+        <div class="form-label" style="margin-bottom:5px">Security check</div>
+        <div id="tsBox"></div>
+        <div class="note" id="tsNote"></div>
       </div>
 
       <div class="err" id="formErr"></div>
@@ -105,36 +115,134 @@ textarea.form-input{resize:vertical;min-height:110px}
 <script>
 const SUPABASE_URL = "https://piamamighqiielfztgic.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA";
-const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);   // used for photo uploads only
 
-const pageLoadTime = Date.now();
-const mathA = Math.floor(Math.random()*8)+2;
-const mathB = Math.floor(Math.random()*8)+2;
-document.getElementById('mathLabel').textContent = `${mathA} + ${mathB}`;
+/* Tickets are created by the submit-ticket edge function, NOT straight from this page, so the bot checks
+   run on the server where they cannot be skipped. */
+const TICKET_ENDPOINT = SUPABASE_URL + "/functions/v1/submit-ticket";
+const TURNSTILE_SITE_KEY = "0x4AAAAAAFMJRQlOEEBAt7Mz";   // Cloudflare Turnstile SITE key (public). Leave "" to fall back to the math question.
 
+const ATTACH_MAX_FILES = 5, ATTACH_MAX_BYTES = 10 * 1024 * 1024;
+
+let formLoadedAt = Date.now();
+let mathA = 0, mathB = 0;
+let formToken = '';
+let tsToken = '';
+let tsWidgetId = null;
+let tsLoading = null;
+
+/* ---------- security check setup ---------- */
+function loadTurnstile(){
+  if(window.turnstile) return Promise.resolve();
+  if(tsLoading) return tsLoading;
+  tsLoading = new Promise((resolve, reject) => {
+    const sc = document.createElement('script');
+    sc.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    sc.async = true; sc.onload = resolve; sc.onerror = reject;
+    document.head.appendChild(sc);
+  });
+  return tsLoading;
+}
+async function fetchFormToken(){
+  try{
+    const r = await fetch(TICKET_ENDPOINT, { method:'POST',
+      headers:{ 'Content-Type':'application/json', 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer ' + SUPABASE_ANON_KEY },
+      body: JSON.stringify({ action:'token' }) });
+    const j = await r.json();
+    return j.token || '';
+  }catch(e){ return ''; }
+}
+function setNote(msg){ const n = document.getElementById('tsNote'); if(n) n.textContent = msg; }
+
+/* Called on load, and again after every submit attempt (Turnstile tokens work only once). */
+function armSecurity(){
+  formLoadedAt = Date.now();
+  tsToken = '';
+  fetchFormToken().then(t => { formToken = t; });
+
+  if(!TURNSTILE_SITE_KEY){
+    mathA = Math.floor(Math.random()*8)+2;
+    mathB = Math.floor(Math.random()*8)+2;
+    document.getElementById('mathLabel').textContent = `${mathA} + ${mathB}`;
+    document.getElementById('f-mathAnswer').value = '';
+    return;
+  }
+
+  // Turnstile mode: hide the math question. It must also stop being "required", otherwise the browser
+  // refuses to submit the form because of a field the visitor cannot see.
+  document.getElementById('mathWrap').style.display = 'none';
+  document.getElementById('f-mathAnswer').required = false;
+  document.getElementById('tsWrap').style.display = 'block';
+  setNote('Loading security check...');
+  const armedAt = formLoadedAt;
+  const slow = setTimeout(() => {
+    if(armedAt === formLoadedAt && !tsToken) setNote('Still waiting for the security check. If nothing appears, turn off ad blockers or privacy extensions for this page and refresh.');
+  }, 8000);
+
+  loadTurnstile().then(() => {
+    if(!window.turnstile) throw new Error('turnstile missing');
+    const box = document.getElementById('tsBox');
+    if(!box) return;
+    if(tsWidgetId !== null && box.firstChild){ try{ window.turnstile.reset(tsWidgetId); return; }catch(e){} }
+    tsWidgetId = window.turnstile.render(box, {
+      sitekey: TURNSTILE_SITE_KEY,
+      callback: tok => { clearTimeout(slow); tsToken = tok; setNote(''); },
+      'expired-callback': () => { tsToken = ''; setNote('The security check expired. It will refresh by itself.'); },
+      'error-callback': code => {
+        tsToken = '';
+        setNote('Security check error' + (code ? ' (' + code + ')' : '') + '. Please refresh the page. If it keeps happening, contact us and quote this code.');
+        console.warn('[turnstile] error', code);
+      }
+    });
+  }).catch(e => {
+    clearTimeout(slow);
+    console.warn('[turnstile] could not load', e);
+    setNote('The security check could not load. Please turn off ad blockers or privacy extensions for this page, then refresh.');
+  });
+}
+armSecurity();
+
+/* ---------- helpers ---------- */
+function validateFiles(files){
+  if(files.length > ATTACH_MAX_FILES) return `Please attach no more than ${ATTACH_MAX_FILES} files.`;
+  for(const f of files){
+    const okType = /^image\//.test(f.type) || f.type === 'application/pdf';
+    if(!okType) return `"${f.name}" is not an image or PDF.`;
+    if(f.size > ATTACH_MAX_BYTES) return `"${f.name}" is over 10 MB.`;
+  }
+  return '';
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* ---------- submit ---------- */
 document.getElementById('ticketForm').addEventListener('submit', async (e)=>{
   e.preventDefault();
   const errEl = document.getElementById('formErr');
   const btn = document.getElementById('submitBtn');
   errEl.textContent = '';
 
-  // Honeypot — real visitors never see or fill this field
-  if(document.getElementById('f-website').value.trim()){
+  // Quick checks for the visitor's benefit. The real enforcement happens on the server.
+  if(document.getElementById('f-hp').value.trim()){
     errEl.textContent = 'Something went wrong. Please try again.';
     return;
   }
-
-  // Timing check — bots submit near-instantly; humans take at least a couple seconds
-  if(Date.now() - pageLoadTime < 2500){
+  if(Date.now() - formLoadedAt < 2500){
     errEl.textContent = 'Please take a moment to review the form before submitting.';
     return;
   }
-
-  // Simple math challenge
-  const mathAnswer = parseInt(document.getElementById('f-mathAnswer').value, 10);
-  if(mathAnswer !== mathA + mathB){
-    errEl.textContent = "That answer does not look right — please check the math question.";
-    return;
+  if(TURNSTILE_SITE_KEY){
+    if(!tsToken){
+      errEl.textContent = 'Please wait for the security check to finish (or turn off your ad blocker for this page), then submit again.';
+      return;
+    }
+  }else{
+    const mathAnswer = parseInt(document.getElementById('f-mathAnswer').value, 10);
+    if(mathAnswer !== mathA + mathB){
+      errEl.textContent = "That answer does not look right — please check the math question.";
+      return;
+    }
   }
 
   const name = document.getElementById('f-name').value.trim();
@@ -149,6 +257,8 @@ document.getElementById('ticketForm').addEventListener('submit', async (e)=>{
     errEl.textContent = 'Please fill in all required fields.';
     return;
   }
+  const fileErr = validateFiles(files);
+  if(fileErr){ errEl.textContent = fileErr; return; }
 
   btn.disabled = true;
   btn.textContent = 'Submitting...';
@@ -163,20 +273,24 @@ document.getElementById('ticketForm').addEventListener('submit', async (e)=>{
       attachments.push({ name: file.name, url: pub.publicUrl });
     }
 
-    const { error } = await sb.from('tickets').insert({
-      source: 'website',
-      status: 'open',
-      priority: 'medium',
-      subject,
-      description: message,
-      customer_name: name,
-      customer_email: email,
-      order_number: order || null,
-      pn: pn || null,
-      attachments,
-      has_unread: true
-    });
-    if(error) throw error;
+    let res, data = {};
+    try{
+      res = await fetch(TICKET_ENDPOINT, { method:'POST',
+        headers:{ 'Content-Type':'application/json', 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer ' + SUPABASE_ANON_KEY },
+        body: JSON.stringify({
+          action:'submit', kind:'contact',
+          name, email, subject, message, order_number: order, pn, attachments,
+          honeypot: document.getElementById('f-hp').value,
+          form_token: formToken, turnstile_token: tsToken
+        }) });
+      data = await res.json().catch(() => ({}));
+    }catch(netErr){
+      throw new Error('Could not reach the server. Please check your connection and try again.');
+    }
+    if(!res.ok || !data.ok){
+      armSecurity();   // the one-time security token is used up - get a fresh one for the retry
+      throw new Error(data.error || 'Something went wrong. Please try again.');
+    }
 
     document.getElementById('card').innerHTML = `
       <div class="success">
@@ -186,15 +300,11 @@ document.getElementById('ticketForm').addEventListener('submit', async (e)=>{
       </div>
     `;
   }catch(err){
-    errEl.textContent = 'Something went wrong: ' + err.message;
+    errEl.textContent = err.message;
     btn.disabled = false;
     btn.textContent = 'Submit Request';
   }
 });
-
-function escapeHtml(s){
-  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
 </script>
 </body>
 </html>
